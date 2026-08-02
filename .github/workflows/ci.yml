@@ -1,0 +1,24 @@
+# Interim: GitHub Actions is not the standing choice (golem ADR 0035), only
+# the stand-in until the self-hosted golem-managed box exists. What it runs
+# is not interim — `nix flake check` is the one gate, the same command that
+# passes on any machine with nix installed.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      # Wires the dull-ca cache: substitutes what it already has, pushes
+      # every path this check builds.
+      - uses: cachix/cachix-action@v15
+        with:
+          name: dull-ca
+          authToken: ${{ secrets.DULL_CA_CACHIX_PRIVATE_KEY }}
+      - run: nix flake check --print-build-logs

@@ -1,0 +1,50 @@
+# Interim: runs on GitHub Actions only until the self-hosted golem-managed
+# box exists (golem ADR 0035); nothing about the update itself depends on
+# GitHub Actions specifically.
+#
+# nginx-static-no-tls inherits `src` and `version` from `pkgs.nginx` rather
+# than pinning its own tarball (see the derivation in flake.nix), so nixpkgs
+# still decides which nginx gets built. This workflow is the other half of
+# that choice: it bumps flake.lock weekly and opens a PR, so an nginx
+# security release lands here as a reviewable, CI-tested change instead of
+# something to remember to pull.
+name: Update flake inputs
+
+on:
+  # Mondays, 06:00 UTC.
+  schedule:
+    - cron: "0 6 * * 1"
+  # Lets the update be triggered on demand, e.g. right after an nginx CVE.
+  workflow_dispatch:
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    # create-pull-request needs both: contents to push the update branch,
+    # pull-requests to open the PR against it.
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+      - uses: cachix/cachix-action@v15
+        with:
+          name: dull-ca
+          authToken: ${{ secrets.DULL_CA_CACHIX_PRIVATE_KEY }}
+      - run: nix flake update
+      # Gate the PR on the same check CI runs, so a nixpkgs bump that
+      # breaks the build never reaches review as something to merge.
+      - run: nix flake check --print-build-logs
+      - uses: peter-evans/create-pull-request@v7
+        with:
+          commit-message: "chore: nix flake update"
+          title: "chore: nix flake update"
+          body: |
+            Automated nixpkgs bump.
+
+            `nginx-static-no-tls` inherits `src` and `version` from
+            `pkgs.nginx`, so this is how nginx security releases arrive.
+            Check the nginx version change in `flake.lock` before merging.
+          branch: automation/flake-update
+          delete-branch: true
