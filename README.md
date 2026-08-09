@@ -135,3 +135,99 @@ interpreter.
 `checks.buildBunPackage-builds-fixture` runs a real `bun install` against the
 npm registry — the one non-hermetic check here, kept so a regression in
 `buildBunPackage` doesn't surface only as a downstream repo's red CI.
+
+## `mkReleaseCommand`
+
+A `release` command for a repository whose `main` is squash-merged with
+conventional-commit subjects. It reads the version out of the commits since the
+latest stable tag, renders `CHANGELOG.md` with git-cliff, shows you every merge
+it read and waits for a literal `Y`, then commits, pushes `main`, tags, and
+pushes the tag.
+
+```nix
+pkgs.mkReleaseCommand {
+  hooks = ./ci/release-hooks.sh;
+  cliffConfig = ./cliff.toml;          # optional; needs repositoryUrl if omitted
+  warmCommand = "warm-cache";          # optional
+  releaseWorkflow = "release.yml";     # optional
+  watchTimeoutSeconds = 1800;          # optional
+}
+```
+
+The result is `bin/release`, plus `bin/release-hooks` when you supply hooks.
+`pkgs.releaseGuards` is the same reading layer as its own package
+(`bin/release-guards`) for a CI job that has to re-check a hand-pushed tag.
+
+**It releases from `main` only**, from a clean checkout level with
+`origin/main`. Everything it refuses, it refuses before anything exists: no
+tag, no commit, no push. The one window where that stops being true is between
+the push of the release commit and the tag — the guards are asked again there,
+and a refusal leaves the release commit on `main` untagged with the version
+unspent.
+
+### How the version is read
+
+A `feat:` in the range asks for a minor; any other conventional type asks for a
+patch; a `!` in the header or a `BREAKING CHANGE:` footer asks for a major. The
+loudest wins.
+
+- **Every conventional type is worth at least a patch**, not only `feat` and
+  `fix`. A `docs:`-only range still has something to publish.
+- **A derived `major` below `1.0` is served as a `minor`**, because a `0.x`
+  minor bump already *is* the incompatible one under Cargo's and npm's rules.
+  `release major`, typed deliberately, is the only path to `v1.0.0`.
+- **A range in which no subject is conventional is refused, not guessed at.** A
+  patch would be a version nobody chose, taken from subjects that are also
+  about to become the changelog.
+
+`release major|minor|patch` overrules the bump and `release vX.Y.Z` the whole
+derivation. Prereleases have no derivation and are always named.
+
+### The hooks are the whole repo-specific half
+
+`mkReleaseCommand` knows nothing about what your repository publishes or which
+file carries its version. A hooks script — dispatching on `$1`, exactly like
+`release-guards` — supplies both. All four subcommands must exist; a repository
+with nothing to do implements them as no-ops, because a silently skipped
+publish guard is worse than none.
+
+| subcommand | when it runs | contract |
+| --- | --- | --- |
+| `assert-ready` | before any tag is read | non-zero refuses. Check the tools your other hooks need — this is the last point at which refusing costs nothing. |
+| `describe VERSION` | building the summary | prints the lines shown above the confirmation and again on success. Nine-column labels (`printf '%-9s %s\n'`) line up with `commit` and `version`. |
+| `assert-unpublished VERSION` | with the tag and ancestor guards | non-zero refuses. Ask your registry whether this version already exists. |
+| `set-version VERSION` | preparing the release commit | writes the version wherever it belongs (without the `v`), then prints each path to stage, one per line. Print nothing if there is no version file. |
+
+`release-guards` is on `PATH` for the hooks, so `describe` can ask
+`release-guards is-stable "$VERSION"` whether `:latest` moves.
+
+A Rust workspace's `set-version` is
+`release-guards set-cargo-workspace-version "$1" <Cargo.toml`, which rewrites
+only the `version` under `[workspace.package]`, followed by `cargo update
+--workspace --offline`, printing `Cargo.toml` and `Cargo.lock`. A bun or npm
+package's is `jq '.version = $version'` printing `package.json` —
+`fixtures/release-hooks/release-hooks.sh` is exactly that, and
+`checks.mkReleaseCommand-runs-repo-hooks` runs it. A repository that publishes
+a container and versions nothing on disk prints nothing and gets a release
+commit carrying `CHANGELOG.md` alone.
+
+### `cliff.toml`
+
+`release/cliff.toml` is the default, and `repositoryUrl` is what it needs: it
+anchors every commit parser to the start of the subject (a `fix:` mid-sentence
+is prose, not a type), and rewrites the trailing `(#N)` GitHub appends to a
+squash subject into a pull-request link. That rewrite is a regex over text the
+subject already carries — **not** `[remote.github]`, which resolves the same
+links over the API and would put a token and a network call inside a release.
+
+The type-to-section mapping in that file is a guess about your repository, not
+a fact about it. Pass your own `cliffConfig` when the guess is wrong; you keep
+the anchoring and the linking by copying them.
+
+### What is *not* in here
+
+The published artifact, the "is it already published" check, the workflow
+watched with `gh`, the version-bearing files, and the cache-warming command.
+Those are `hooks` and `warmCommand`. Adding any of them here would make this
+package know about one repository.
+
