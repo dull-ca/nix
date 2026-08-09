@@ -135,3 +135,193 @@ interpreter.
 `checks.buildBunPackage-builds-fixture` runs a real `bun install` against the
 npm registry — the one non-hermetic check here, kept so a regression in
 `buildBunPackage` doesn't surface only as a downstream repo's red CI.
+
+## `mkReleaseCommand`
+
+A `release` command for a repository whose `main` is squash-merged with
+conventional-commit subjects. It reads the version out of the commits since the
+latest stable tag, renders `CHANGELOG.md` with git-cliff, shows you every merge
+it read and waits for a literal `Y`, then commits, pushes `main`, tags, and
+pushes the tag.
+
+```nix
+pkgs.mkReleaseCommand {
+  repositoryUrl = "https://github.com/you/repo";  # builds the default cliff.toml
+  hooks = ./ci/release-hooks.sh;                  # what this repo publishes
+  cliffConfig = ./cliff.toml;                     # replaces repositoryUrl
+  warmCommand = "warm-cache";                     # run the gate before pushing
+  releaseWorkflow = "release.yml";                # wait for this run, report it
+  watchTimeoutSeconds = 1800;                     # default
+}
+```
+
+Every argument is optional, but one of `repositoryUrl` and `cliffConfig` has to
+be there — the first builds the bundled `cliff.toml`, the second replaces it,
+and passing neither throws at evaluation. Everything else absent means "this
+repository does not do that": no hooks, no cache to warm, no workflow to wait
+on.
+
+The overlay carries three members:
+
+- **`mkReleaseCommand`** — the builder above. The result is `bin/release`, plus
+  `bin/release-hooks` when you supply hooks.
+- **`releaseGuards`** — the same reading layer as its own package
+  (`bin/release-guards`), for a CI job that has to re-check a tag someone
+  pushed by hand. `bin/release` already has it on `PATH`.
+- **`releaseGuardsTest`** — the guard suite as a derivation. Put it in your own
+  `checks`; don't assume it passed here. Your repository pins its own dull-nix
+  revision and resolves `bash`, `awk`, `sort` and `grep` through its own
+  nixpkgs, and these are the checks that decide what you may publish.
+
+```nix
+checks.x86_64-linux.release-guards-hold = pkgs.releaseGuardsTest;
+```
+
+Three constraints, none of them configurable:
+
+- **Releases run from `main`.** A clean checkout, level with `origin/main`,
+  branch named `main`. Detached `HEAD`, a dirty tree, a stale clone, or any
+  other branch is refused.
+- **The changelog is `CHANGELOG.md`.** git-cliff rewrites it in full on every
+  release, at the repository root, under that name.
+- **A hooks script supplying one subcommand supplies all four.** There is no
+  partial hooks script.
+
+Everything it refuses, it refuses before anything exists: no tag, no commit, no
+push. The one window where that stops being true is between the push of the
+release commit and the tag — the guards are asked again there, and a refusal
+leaves the release commit on `main` untagged with the version unspent.
+
+### How the version is read
+
+A `feat:` in the range asks for a minor; any other conventional type asks for a
+patch; a `!` in the header or a `BREAKING CHANGE:` footer asks for a major. The
+loudest wins.
+
+- **Every conventional type is worth at least a patch**, not only `feat` and
+  `fix`. A `docs:`-only range still has something to publish.
+- **A derived `major` below `1.0` is served as a `minor`**, because a `0.x`
+  minor bump already *is* the incompatible one under Cargo's and npm's rules.
+  `release major`, typed deliberately, is the only path to `v1.0.0`.
+- **A range in which no subject is conventional is refused, not guessed at.** A
+  patch would be a version nobody chose, taken from subjects that are also
+  about to become the changelog.
+
+`release major|minor|patch` overrules the bump and `release vX.Y.Z` the whole
+derivation. Prereleases have no derivation and are always named.
+
+### The hooks are the whole repo-specific half
+
+`mkReleaseCommand` knows nothing about what your repository publishes or which
+file carries its version. A hooks script — dispatching on `$1`, exactly like
+`release-guards` — supplies both.
+
+**Supply one subcommand and you supply all four.** A repository with nothing to
+check writes the no-op out; it does not leave the case to fall through. A hook
+that is called and not implemented hits the usage arm, and a publish guard that
+quietly does not run is worse than one that was never written.
+
+| subcommand | when it runs | contract |
+| --- | --- | --- |
+| `assert-ready` | before any tag is read | non-zero refuses. Check the tools your other hooks need — this is the last point at which refusing costs nothing. |
+| `describe VERSION` | building the summary | prints the lines shown above the confirmation and again on success. Nine-column labels (`printf '%-9s %s\n'`) line up with `commit` and `version`. |
+| `assert-unpublished VERSION` | with the tag and ancestor guards | non-zero refuses. Ask your registry whether this version already exists. |
+| `set-version VERSION` | preparing the release commit | writes the version wherever it belongs (without the `v`), then prints each path to stage, one per line. Print nothing if there is no version file. |
+
+`release-guards` is on `PATH` for the hooks, so `describe` can ask
+`release-guards is-stable "$VERSION"` whether a `:latest` pointer moves.
+
+### `set-version` names the files; the driver stages them
+
+`release` writes `CHANGELOG.md` and stages exactly one other thing: whatever
+`set-version` printed. That is the only reason the release command has no
+opinion about your version file.
+
+- A **Rust workspace** runs
+  `release-guards set-cargo-workspace-version "$1" <Cargo.toml` — which rewrites
+  the `version` under `[workspace.package]` and nothing that merely looks like
+  it — then `cargo update --workspace --offline`, and prints `Cargo.toml` and
+  `Cargo.lock`.
+- A **node package** runs `jq`, and prints `package.json`.
+- A repository that publishes a container and **versions nothing on disk**
+  prints nothing, and gets a release commit carrying `CHANGELOG.md` alone.
+
+### A worked example, with no Rust in it
+
+`fixtures/release-hooks/release-hooks.sh`, in full — the whole contract for a
+node package. `checks.mkReleaseCommand-runs-repo-hooks` runs it.
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+refuse() {
+  printf 'refusing to release: %s\n' "$*" >&2
+  return 1
+}
+
+assert_ready() {
+  command -v jq >/dev/null 2>&1 \
+    || refuse 'jq is missing, and jq is what writes the version into package.json'
+}
+
+assert_unpublished() {
+  :
+}
+
+describe() {
+  local version=${1-}
+  printf '%-9s %s -> %s\n' package "$(jq -r .version package.json)" "${version#v}"
+}
+
+set_version() {
+  local version=${1-} updated
+  updated=$(jq --arg version "$version" '.version = $version' package.json) || return 1
+  printf '%s\n' "$updated" >package.json
+  printf 'package.json\n'
+}
+
+case ${1-} in
+  assert-ready) assert_ready ;;
+  assert-unpublished) assert_unpublished "${2-}" ;;
+  describe) describe "${2-}" ;;
+  set-version) set_version "${2-}" ;;
+  *)
+    printf 'usage: release-hooks {assert-ready|assert-unpublished|describe|set-version} ARGUMENT\n' >&2
+    exit 2
+    ;;
+esac
+```
+
+`assert-unpublished` is a `:` because this fixture publishes nothing — written
+out, not omitted. `set-version` reads `package.json` into a variable before
+writing it back, because a redirect would truncate the file before `jq` read
+it. Wire it up with:
+
+```nix
+pkgs.mkReleaseCommand {
+  repositoryUrl = "https://github.com/you/your-repo";
+  hooks = ./ci/release-hooks.sh;
+}
+```
+
+### `cliff.toml`
+
+`release/cliff.toml` is the default, and `repositoryUrl` is what it needs: it
+anchors every commit parser to the start of the subject (a `fix:` mid-sentence
+is prose, not a type), and rewrites the trailing `(#N)` GitHub appends to a
+squash subject into a pull-request link. That rewrite is a regex over text the
+subject already carries — **not** `[remote.github]`, which resolves the same
+links over the API and would put a token and a network call inside a release.
+
+The type-to-section mapping in that file is a guess about your repository, not
+a fact about it. Pass your own `cliffConfig` when the guess is wrong; you keep
+the anchoring and the linking by copying them.
+
+### What is *not* in here
+
+The published artifact, the "is it already published" check, the workflow
+watched with `gh`, the version-bearing files, and the cache-warming command.
+Those are `hooks` and `warmCommand`. Adding any of them here would make this
+package know about one repository.
+

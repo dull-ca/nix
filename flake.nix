@@ -157,6 +157,102 @@
             # against the same node_modules, without re-fetching under a second hash.
             passthru = { inherit bunDeps; } // passthru;
           } // forwarded);
+
+        releaseGuards = final.runCommand "release-guards"
+          {
+            meta.mainProgram = "release-guards";
+          } ''
+          mkdir -p $out/bin
+          install -m 0755 ${./release/release-guards.sh} $out/bin/release-guards
+          patchShebangs $out/bin
+        '';
+
+        # Handed to consumers as a check they run, not a result they inherit.
+        # `checks.release-guards-hold` below proves the guards hold under this
+        # repository's nixpkgs at this revision; a consumer pins a dull-nix
+        # revision of its own and resolves bash, awk, sort and grep through a
+        # nixpkgs of its own, and the guards decide what that repository may
+        # publish. Cheap enough that every consumer running it is the right
+        # trade against any of them trusting a run it did not do.
+        releaseGuardsTest = final.runCommand "release-guards-hold"
+          {
+            nativeBuildInputs = [ final.bash ];
+          } ''
+          bash ${./release/release-guards.test.sh} \
+            ${final.releaseGuards}/bin/release-guards
+          touch $out
+        '';
+
+        # `bin/release`, wrapped so the repo-specific half travels in the
+        # environment and the script itself stays free of any one repository.
+        # `hooks`, `warmCommand` and `releaseWorkflow` default to null, which
+        # reaches release.sh as an empty string meaning "this repository does
+        # not do that". One of `repositoryUrl` and `cliffConfig` is required --
+        # the throw below is the only argument error this builder can raise. The
+        # release branch and `CHANGELOG.md` are not arguments at all; see
+        # release.sh.
+        #
+        # `hooks` is installed rather than pointed at where nix put it: a file
+        # copied to the store lands read-only and non-executable, and `release`
+        # runs it as a command. `install -m 0755` plus `patchShebangs` is what
+        # makes it one.
+        mkReleaseCommand =
+          { hooks ? null
+          , cliffConfig ? null
+          , repositoryUrl ? null
+          , warmCommand ? null
+          , releaseWorkflow ? null
+          , watchTimeoutSeconds ? 1800
+          }:
+          let
+            inherit (final) lib;
+
+            generatedCliffConfig =
+              if repositoryUrl == null then
+                throw ''
+                  mkReleaseCommand needs a repositoryUrl to build the default
+                  cliff.toml from, or a cliffConfig of its own.
+                ''
+              else
+                final.runCommand "cliff.toml" { } ''
+                  substitute ${./release/cliff.toml} $out \
+                    --replace-fail '@repositoryUrl@' '${repositoryUrl}'
+                '';
+
+            resolvedCliffConfig =
+              if cliffConfig != null then cliffConfig else generatedCliffConfig;
+          in
+          final.runCommand "release"
+            {
+              nativeBuildInputs = [ final.makeWrapper ];
+              # Exposed because the substituted config is otherwise unreachable
+              # -- a caller who passed no `cliffConfig` has no name for the one
+              # it got. `checks.default-cliff-config-renders` renders through
+              # this.
+              passthru.cliffConfig = resolvedCliffConfig;
+              meta.mainProgram = "release";
+            } ''
+            mkdir -p $out/bin
+            install -m 0755 ${./release/release.sh} $out/bin/release
+            ${lib.optionalString (hooks != null) ''
+              install -m 0755 ${hooks} $out/bin/release-hooks
+            ''}
+            patchShebangs $out/bin
+
+            wrapProgram $out/bin/release \
+              --prefix PATH : ${final.releaseGuards}/bin \
+              --set RELEASE_CLIFF_CONFIG ${resolvedCliffConfig} \
+              --set RELEASE_WATCH_TIMEOUT_SECONDS ${toString watchTimeoutSeconds} \
+              --set RELEASE_HOOKS ${
+                if hooks == null then "''" else "$out/bin/release-hooks"
+              } \
+              --set RELEASE_WARM_COMMAND ${
+                if warmCommand == null then "''" else lib.escapeShellArg warmCommand
+              } \
+              --set RELEASE_WORKFLOW ${
+                if releaseWorkflow == null then "''" else lib.escapeShellArg releaseWorkflow
+              }
+          '';
       };
     } // flake-utils.lib.eachSystem [ "x86_64-linux" ] (system:
       let
@@ -288,14 +384,137 @@
           src = ./fixtures/bun-package;
           bunDepsHash = pkgs.lib.fakeHash;
         };
+
+        # A consumer with no Rust in it: the hooks write package.json, and the
+        # cliff.toml comes from the shared default rather than a per-repo one.
+        releaseFixture = pkgs.mkReleaseCommand {
+          repositoryUrl = "https://github.com/dull-ca/release-fixture";
+          hooks = ./fixtures/release-hooks/release-hooks.sh;
+        };
       in
       {
         packages = {
           inherit nginx-static-no-tls;
+          release-guards = pkgs.releaseGuards;
           default = nginx-static-no-tls;
         };
 
         checks = {
+          release-guards-hold = pkgs.releaseGuardsTest;
+
+          # The version-bearing file is the consumer's business, so the builder
+          # is only correct if a hook it never heard of can carry it. This one
+          # is package.json and jq -- no Cargo anywhere.
+          mkReleaseCommand-runs-repo-hooks =
+            pkgs.runCommand "mkReleaseCommand-runs-repo-hooks"
+              { nativeBuildInputs = [ pkgs.jq ]; } ''
+              cp ${./fixtures/release-hooks/package.json} package.json
+              chmod u+w package.json
+
+              described=$(${releaseFixture}/bin/release-hooks describe v1.2.3)
+              echo "describe: $described"
+              case "$described" in
+                *"0.1.0 -> 1.2.3"*) ;;
+                *)
+                  echo "FAIL: describe did not report the version transition."
+                  exit 1
+                  ;;
+              esac
+
+              staged=$(${releaseFixture}/bin/release-hooks set-version 1.2.3)
+              if [ "$staged" != "package.json" ]; then
+                echo "FAIL: set-version named '$staged' as the file to stage,"
+                echo "so the release commit would not carry package.json."
+                exit 1
+              fi
+
+              written=$(jq -r .version package.json)
+              if [ "$written" != "1.2.3" ]; then
+                echo "FAIL: package.json still reads $written -- set-version wrote nothing."
+                cat package.json
+                exit 1
+              fi
+
+              echo "hooks carried the version into package.json" > $out
+            '';
+
+          # Reached through the wrapper, so a broken RELEASE_* setting or a
+          # release-guards that fell off PATH fails here rather than during
+          # someone's release.
+          release-refuses-a-dirty-tree =
+            pkgs.runCommand "release-refuses-a-dirty-tree"
+              { nativeBuildInputs = [ pkgs.git pkgs.git-cliff ]; } ''
+              export HOME=$TMPDIR
+              git init --quiet --initial-branch=main repo
+              cd repo
+              git config user.email fixture@example.com
+              git config user.name fixture
+              echo one > file
+              git add file
+              git commit --quiet -m 'feat: a thing'
+              echo two > file
+
+              if ${releaseFixture}/bin/release > out.log 2>&1; then
+                echo "FAIL: release accepted a dirty working tree."
+                cat out.log
+                exit 1
+              fi
+
+              if ! grep -q 'the working tree is dirty' out.log; then
+                echo "FAIL: release refused, but not for the dirty tree -- something"
+                echo "earlier in the wrapper is broken:"
+                cat out.log
+                exit 1
+              fi
+
+              cp out.log $out
+            '';
+
+          # The default cliff.toml is only a default if it renders. Asserts the
+          # repositoryUrl reached both the commit link and the (#N) rewrite,
+          # and that the parsers still sort commits into sections.
+          default-cliff-config-renders =
+            pkgs.runCommand "default-cliff-config-renders"
+              { nativeBuildInputs = [ pkgs.git pkgs.git-cliff ]; } ''
+              if grep -q '@repositoryUrl@' ${releaseFixture.cliffConfig}; then
+                echo "FAIL: the cliff.toml template still holds its placeholder."
+                exit 1
+              fi
+
+              export HOME=$TMPDIR
+              git init --quiet --initial-branch=main repo
+              cd repo
+              git config user.email fixture@example.com
+              git config user.name fixture
+              echo one > file && git add file
+              git commit --quiet -m 'feat(scope): the first thing (#7)'
+              echo two > file && git add file
+              git commit --quiet -m 'fix: the second thing'
+              echo three > file && git add file
+              git commit --quiet -m 'chore(release): v0.0.1'
+
+              git-cliff --config ${releaseFixture.cliffConfig} --tag v0.1.0 \
+                --unreleased --strip header > rendered.md
+              cat rendered.md
+
+              grep -q '^### Features' rendered.md \
+                || { echo "FAIL: no Features section"; exit 1; }
+              grep -q '^### Fixes' rendered.md \
+                || { echo "FAIL: no Fixes section"; exit 1; }
+              grep -q '\*\*scope\*\*' rendered.md \
+                || { echo "FAIL: the scope was dropped"; exit 1; }
+              grep -qF '[#7](https://github.com/dull-ca/release-fixture/pull/7)' rendered.md \
+                || { echo "FAIL: the (#N) suffix was not linked"; exit 1; }
+              grep -qF '(https://github.com/dull-ca/release-fixture/commit/' rendered.md \
+                || { echo "FAIL: the commit link is missing"; exit 1; }
+              if grep -q 'chore(release)' rendered.md; then
+                echo "FAIL: the release commit was not skipped"
+                exit 1
+              fi
+
+              cp rendered.md $out
+            '';
+
           # A binary that builds is not necessarily a binary that serves.
           nginx-static-no-tls-serves =
             pkgs.runCommand "nginx-static-no-tls-serves"
