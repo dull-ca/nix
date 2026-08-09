@@ -318,6 +318,40 @@
           src = ./fixtures/bun-package;
           bunDepsHash = "sha256-PaMiYRjIKk5QjvXhbvfVPSJNz2fhCIZuBT9SPOUo1rg=";
         };
+
+        # Backs buildBunPackage-forwards-and-merges-caller-args, below.
+        # bunDepsHash is pkgs.lib.fakeHash on purpose: that check only reads
+        # drvAttrs and passthru off this derivation, never anything that
+        # forces bunDeps to build, so the hash never needs to be real.
+        bunPackageMergeProbe = pkgs.buildBunPackage {
+          pname = "buildBunPackage-merge-probe";
+          src = ./fixtures/bun-package;
+          bunDepsHash = pkgs.lib.fakeHash;
+          nativeBuildInputs = [ pkgs.hello ];
+          buildInputs = [ pkgs.jq ];
+          passthru = { buildBunPackageProbeMarker = "buildBunPackage-merge-probe-marker"; };
+          installPhase = ''
+            runHook preInstall
+            echo buildBunPackage-merge-probe-install-ran > $out
+            runHook postInstall
+          '';
+        };
+
+        # Backs buildBunPackage-bunDeps-stable-across-pname, below: same src
+        # and bunDepsHash on both probes, pname differing is the only thing
+        # under test. fakeHash again -- see that check's comment for why
+        # comparing their bunDeps store paths never needs a real build.
+        bunPackageStabilityProbeA = pkgs.buildBunPackage {
+          pname = "buildBunPackage-stability-probe-a";
+          src = ./fixtures/bun-package;
+          bunDepsHash = pkgs.lib.fakeHash;
+        };
+
+        bunPackageStabilityProbeB = pkgs.buildBunPackage {
+          pname = "buildBunPackage-stability-probe-b-different-name";
+          src = ./fixtures/bun-package;
+          bunDepsHash = pkgs.lib.fakeHash;
+        };
       in
       {
         packages = {
@@ -512,6 +546,130 @@
               fi
 
               cat ${bunFixture}/style.css > $out
+            '';
+
+          # Caller args win over the builder's defaults, and
+          # nativeBuildInputs/buildInputs/passthru merge rather than replace
+          # -- neither is visible from reading buildBunPackage above, and a
+          # downstream repo builds on both: overriding installPhase outright
+          # to reuse buildBunPackage for a check script, and adding its own
+          # nativeBuildInputs alongside bun/nodejs/autoPatchelfHook rather
+          # than losing them. bunPackageMergeProbe supplies one caller
+          # argument per property; this asserts each survived, rather than
+          # leaving it proven only by a one-off `nix eval`.
+          buildBunPackage-forwards-and-merges-caller-args =
+            let
+              nativeBuildInputNames =
+                map (d: d.pname or d.name) bunPackageMergeProbe.drvAttrs.nativeBuildInputs;
+              buildInputNames =
+                map (d: d.pname or d.name) bunPackageMergeProbe.drvAttrs.buildInputs;
+              hasCallerPassthruMarker =
+                (bunPackageMergeProbe.buildBunPackageProbeMarker or null)
+                == "buildBunPackage-merge-probe-marker";
+              hasBuilderPassthruBunDeps = bunPackageMergeProbe ? bunDeps;
+              installPhaseOverridden =
+                bunPackageMergeProbe.drvAttrs.installPhase == ''
+                  runHook preInstall
+                  echo buildBunPackage-merge-probe-install-ran > $out
+                  runHook postInstall
+                '';
+            in
+            pkgs.runCommand "buildBunPackage-forwards-and-merges-caller-args" {
+              nativeBuildInputNames = toString nativeBuildInputNames;
+              buildInputNames = toString buildInputNames;
+              hasCallerPassthruMarker = if hasCallerPassthruMarker then "true" else "false";
+              hasBuilderPassthruBunDeps = if hasBuilderPassthruBunDeps then "true" else "false";
+              installPhaseOverridden = if installPhaseOverridden then "true" else "false";
+            } ''
+              for name in bun nodejs auto-patchelf-hook hello; do
+                case " $nativeBuildInputNames " in
+                  *" $name "*) ;;
+                  *)
+                    echo "FAIL: nativeBuildInputs is missing '$name' -- caller-supplied"
+                    echo "nativeBuildInputs is replacing the builder's own list instead of"
+                    echo "being appended to it. Got: $nativeBuildInputNames"
+                    exit 1
+                    ;;
+                esac
+              done
+
+              for name in gcc jq; do
+                case " $buildInputNames " in
+                  *" $name "*) ;;
+                  *)
+                    echo "FAIL: buildInputs is missing '$name' -- caller-supplied buildInputs"
+                    echo "is replacing the builder's own list instead of being appended to"
+                    echo "it. Got: $buildInputNames"
+                    exit 1
+                    ;;
+                esac
+              done
+
+              if [ "$hasCallerPassthruMarker" != "true" ]; then
+                echo "FAIL: a caller-supplied passthru attribute did not survive --"
+                echo "passthru is replacing the builder's own attrset instead of being"
+                echo "merged with it."
+                exit 1
+              fi
+
+              if [ "$hasBuilderPassthruBunDeps" != "true" ]; then
+                echo "FAIL: passthru.bunDeps is gone once a caller supplies its own"
+                echo "passthru -- callers can no longer reuse the deps tree via"
+                echo "<result>.bunDeps."
+                exit 1
+              fi
+
+              if [ "$installPhaseOverridden" != "true" ]; then
+                echo "FAIL: a caller-supplied installPhase did not win over the builder's"
+                echo "default installPhase -- forwarded caller args are no longer merged"
+                echo "in last."
+                exit 1
+              fi
+
+              echo "caller args merge and override correctly" > $out
+            '';
+
+          # The least intuitive of buildBunPackage's interface properties:
+          # two calls with the same src and bunDepsHash but different pname
+          # resolve to the same bunDeps store path (see the comment on
+          # bunDeps in buildBunPackage above -- a fixed-output derivation's
+          # store path is a function of (name, hashAlgo, hash) alone). Break
+          # this -- e.g. by deriving fetchBunDeps's pname from the caller's
+          # pname -- and two consumers building the identical bun.lock
+          # silently get two separate deps trees instead of sharing one.
+          buildBunPackage-bunDeps-stable-across-pname =
+            let
+              # unsafeDiscardStringContext, not plain .outPath: an outPath
+              # string normally carries context -- a reference to the
+              # derivation that produced it -- and placing it into another
+              # derivation's attrset (e.g. as this runCommand's env) with
+              # that context intact makes Nix realise the referenced
+              # derivation to produce the string. Discarding it first keeps
+              # this check to comparing two store-path strings, computable
+              # from the probes' (name, hashAlgo, hash) without a real `bun
+              # install`. Verified both ways: leaving context in forces a
+              # real build of the fakeHash-hashed FOD, which then fails on
+              # the hash mismatch it's deliberately given.
+              aBunDepsPath =
+                builtins.unsafeDiscardStringContext bunPackageStabilityProbeA.bunDeps.outPath;
+              bBunDepsPath =
+                builtins.unsafeDiscardStringContext bunPackageStabilityProbeB.bunDeps.outPath;
+            in
+            pkgs.runCommand "buildBunPackage-bunDeps-stable-across-pname" {
+              inherit aBunDepsPath bBunDepsPath;
+            } ''
+              if [ "$aBunDepsPath" != "$bBunDepsPath" ]; then
+                echo "FAIL: two buildBunPackage calls with the same src and bunDepsHash"
+                echo "but different pname produced different bunDeps store paths:"
+                echo "  $aBunDepsPath"
+                echo "  $bBunDepsPath"
+                echo "This means fetchBunDeps's pname is being derived from the caller's"
+                echo "pname again, which breaks reuse of a shared deps tree across"
+                echo "callers building the same bun.lock."
+                exit 1
+              fi
+
+              echo "bunDeps stable across pname: $aBunDepsPath" > $out
             '';
         };
       });
