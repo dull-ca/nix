@@ -15,21 +15,160 @@
   };
 
   outputs = { self, nixpkgs, flake-utils }:
-    flake-utils.lib.eachSystem [ "x86_64-linux" ] (system:
+    {
+      overlays.default = final: prev: {
+        # bun equivalent of fetchNpmDeps (nixpkgs-unstable has none yet). Like
+        # npmDepsHash, `hash` needs bumping whenever a consumer's bun.lock changes.
+        fetchBunDeps =
+          { src
+          , hash
+          , pname ? "bun-deps"
+          }:
+          let
+            # Only these two files affect what `bun install` resolves; anything
+            # else under `src` must not force a network-hitting rebuild.
+            lockSrc = final.lib.cleanSourceWith {
+              inherit src;
+              name = "${pname}-lock-src";
+              filter = path: type:
+                type == "regular"
+                && builtins.elem (baseNameOf path) [ "package.json" "bun.lock" ];
+            };
+          in
+          final.stdenvNoCC.mkDerivation {
+            inherit pname;
+            version = "0";
+            src = lockSrc;
+
+            nativeBuildInputs = [ final.bun final.cacert ];
+
+            buildPhase = ''
+              runHook preBuild
+              export HOME=$TMPDIR
+              # stdenvNoCC has no system CA trust store; without this, bun's
+              # HTTPS requests to the registry fail cert verification.
+              export SSL_CERT_FILE=${final.cacert}/etc/ssl/certs/ca-bundle.crt
+              # --ignore-scripts: no dependency postinstall runs (unsupported by
+              # this builder), which also keeps the FOD hash reproducible.
+              bun install --frozen-lockfile --no-progress --ignore-scripts
+              runHook postBuild
+            '';
+
+            installPhase = ''
+              runHook preInstall
+              # Per-install bookkeeping bun writes; left in, they'd make this
+              # FOD's output hash unreproducible between identical builds.
+              rm -rf node_modules/.cache
+              find node_modules -name '.bun-tag*' -delete
+              cp -r node_modules $out
+              runHook postInstall
+            '';
+
+            dontFixup = true;
+            outputHashMode = "recursive";
+            outputHashAlgo = "sha256";
+            outputHash = hash;
+          };
+
+        buildBunPackage =
+          { src
+          , bunDepsHash
+          , buildScript ? "build"
+          , installDir ? "dist"
+          , nativeBuildInputs ? [ ]
+          , buildInputs ? [ ]
+          , passthru ? { }
+          , ...
+          }@args:
+          let
+            # No pname forwarded: an FOD's store path depends only on
+            # (name, hashAlgo, hash), so leaving it off keeps every caller
+            # building the same bun.lock on one shared bunDeps path.
+            bunDeps = final.fetchBunDeps {
+              inherit src;
+              hash = bunDepsHash;
+            };
+
+            forwarded = builtins.removeAttrs args [
+              "bunDepsHash"
+              "buildScript"
+              "installDir"
+              "nativeBuildInputs"
+              "buildInputs"
+              "passthru"
+            ];
+          in
+          # forwarded merges in last, so a caller can override any attribute
+          # below, including phases (used downstream to override installPhase
+          # outright for a build with no output dir to `cp -r`).
+          final.stdenvNoCC.mkDerivation ({
+            inherit src;
+            version = "0";
+
+            # Appended, not replaced by forwarded's `//`, so a caller's own
+            # nativeBuildInputs/buildInputs/passthru add to these rather than
+            # losing bun, nodejs, autoPatchelfHook and bunDeps.
+            nativeBuildInputs = [
+              final.bun
+              final.nodejs
+              final.autoPatchelfHook
+            ] ++ nativeBuildInputs;
+
+            buildInputs = [ final.stdenv.cc.cc.lib ] ++ buildInputs;
+
+            # bun installs musl-linux-x64 native builds alongside the gnu ones
+            # this platform loads; musl's libc dep is never actually missing,
+            # just never loaded. Without this, autoPatchelf treats it as fatal:
+            # "could not satisfy dependency libc.musl-x86_64.so.1".
+            autoPatchelfIgnoreMissingDeps = [ "libc.musl-x86_64.so.1" ];
+            # $out holds JS/CSS by the time autoPatchelfHook's fixup pass would
+            # run, not ELF; the deps tree is patched explicitly below instead.
+            dontAutoPatchelf = true;
+
+            configurePhase = ''
+              runHook preConfigure
+              cp -r ${bunDeps} node_modules
+              chmod -R u+w node_modules
+              autoPatchelf node_modules
+              # Whole tree, not node_modules/.bin: this fixture can't prove the
+              # wider scope necessary (.bin entries are symlinks patchShebangs
+              # follows anyway), but the real dull.yyc.dev site build needs it --
+              # astro reaches node_modules/astro/astro.js by a relative path,
+              # never through .bin, and a narrower scan leaves its shebang
+              # unpatched with a bad interpreter.
+              patchShebangs node_modules
+              runHook postConfigure
+            '';
+
+            buildPhase = ''
+              runHook preBuild
+              export HOME=$TMPDIR
+              bun run ${buildScript}
+              runHook postBuild
+            '';
+
+            installPhase = ''
+              runHook preInstall
+              cp -r ${installDir} $out
+              runHook postInstall
+            '';
+
+            # Exposes the deps tree via `<result>.bunDeps` for e.g. lint/typecheck
+            # against the same node_modules, without re-fetching under a second hash.
+            passthru = { inherit bunDeps; } // passthru;
+          } // forwarded);
+      };
+    } // flake-utils.lib.eachSystem [ "x86_64-linux" ] (system:
       let
-        pkgs = import nixpkgs { inherit system; };
+        pkgs = import nixpkgs {
+          inherit system;
+          overlays = [ self.overlays.default ];
+        };
         static = pkgs.pkgsStatic;
 
-        # Our own build of nginx, NOT an override of nixpkgs' package.
-        #
-        # `nginx.override` cannot produce this: generic.nix hardcodes an
-        # unconditional module list (ssl, v3, xslt, dav, flv, mp4), the inner
-        # `configureFlags` argument only appends, and nginx's configure has no
-        # `--without-` for opt-in modules. So the build configuration is ours.
-        #
-        # But `src` and `version` are inherited, so nixpkgs still decides which
-        # nginx we build and its security bumps reach us through a routine
-        # `nix flake update` with no hash to hand-edit.
+        # Own build, not nginx.override: generic.nix hardcodes a module list
+        # nginx's ./configure has no flag to unset. src/version still come
+        # from pkgs.nginx, so nixpkgs' security bumps still reach us.
         nginx-static-no-tls = static.stdenv.mkDerivation {
           pname = "nginx-static-no-tls";
           inherit (pkgs.nginx) src version;
@@ -37,14 +176,13 @@
           buildInputs = [ static.pcre2 static.zlib ];
           nativeBuildInputs = [ pkgs.nukeReferences ];
 
-          # The static stdenv adapter appends `--enable-static --disable-shared`,
-          # which nginx's hand-rolled ./configure rejects outright. This suppresses
-          # them. (It only works when set in the derivation's own args — setting it
-          # through `overrideAttrs` on nixpkgs' nginx silently does nothing.)
+          # Suppresses the static adapter's --enable-static --disable-shared,
+          # which nginx's ./configure rejects. Must be set here, not via
+          # overrideAttrs on nixpkgs' nginx (that silently does nothing).
           dontAddStaticConfigureFlags = true;
 
-          # stdenv's generic configure phase otherwise adds `--prefix=$out`,
-          # `--build=` and `--host=`; nginx rejects the autoconf platform flags.
+          # nginx rejects the autoconf platform flags (--prefix, --build, --host)
+          # stdenv's generic configure phase would otherwise add.
           dontAddPrefix = true;
           configurePlatforms = [ ];
 
@@ -57,8 +195,7 @@
             "--pid-path=/tmp/nginx.pid"
             "--http-client-body-temp-path=/tmp/client_body"
             "--with-http_gzip_static_module"
-            # Included because this image is designed to sit behind a proxy;
-            # without it every access log line shows the proxy's address.
+            # Behind a proxy, without this every access log line shows the proxy's address.
             "--with-http_realip_module"
             "--with-threads"
             "--without-http_proxy_module"
@@ -69,9 +206,8 @@
             "--crossbuild=Linux::x86_64"
           ];
 
-          # `make install` would try to create /etc/nginx inside the sandbox and
-          # die on Permission denied. Copying objs/nginx directly also keeps the
-          # store path out of the binary.
+          # `make install` would create /etc/nginx inside the sandbox and die on
+          # Permission denied; copy objs/nginx directly instead.
           installPhase = ''
             runHook preInstall
             mkdir -p $out/bin $out/conf
@@ -80,11 +216,9 @@
             runHook postInstall
           '';
 
-          # nuke-refs is safe only because the binary is statically linked: the
-          # store paths it clears are dead strings in nginx's -V banner, not
-          # runtime dependencies. Removing nix-support matters just as much —
-          # its propagated-build-inputs file names the pcre2-dev and zlib-dev
-          # paths and alone dragged the closure from 1.7 MB to 7.75 MB.
+          # Safe only because the binary is static (nuke-refs clears dead strings
+          # from -V, not runtime deps). nix-support's propagated-build-inputs
+          # alone dragged the closure from 1.7 MB to 7.75 MB.
           postFixup = ''
             nuke-refs $out/bin/nginx
             rm -rf $out/nix-support
@@ -101,20 +235,59 @@
           };
         };
 
-        # The three headline properties below are the entire reason this
-        # package exists rather than `pkgs.nginx`. Nothing about them is
-        # self-evident from the build, and the weekly `update.yml` nixpkgs
-        # bump can regress any of them silently -- so each is asserted as a
-        # check that fails the gate.
+        # Backs the checks below, which guard the properties an nginx bump
+        # could silently regress.
         nginxClosure = pkgs.closureInfo { rootPaths = [ nginx-static-no-tls ]; };
 
-        # A ceiling with headroom, not the exact 1,686,352 bytes the closure
-        # measures today: an exact figure would turn every harmless nginx
-        # point release into a red build. This is a tripwire for a structural
-        # regression -- a reintroduced dynamic dependency or a restored
-        # `nix-support` -- both of which are multi-megabyte jumps, not
-        # kilobyte drift.
+        # Headroom above today's 1,686,352 bytes, not that exact figure --
+        # a tripwire for a structural regression (multi-megabyte), not
+        # kilobyte drift from a routine nginx point release.
         closureSizeCeilingBytes = 2500000;
+
+        # Exercises both a symlinked .bin shebang (esbuild) and platform-split
+        # natives (lightningcss, asserted by the check below).
+        bunFixtureDeps = pkgs.fetchBunDeps {
+          src = ./fixtures/bun-package;
+          pname = "bun-fixture-deps";
+          hash = "sha256-PaMiYRjIKk5QjvXhbvfVPSJNz2fhCIZuBT9SPOUo1rg=";
+        };
+
+        bunFixture = pkgs.buildBunPackage {
+          pname = "bun-fixture";
+          src = ./fixtures/bun-package;
+          bunDepsHash = "sha256-PaMiYRjIKk5QjvXhbvfVPSJNz2fhCIZuBT9SPOUo1rg=";
+        };
+
+        # Backs buildBunPackage-forwards-and-merges-caller-args, below.
+        # fakeHash is fine: that check only reads drvAttrs/passthru, never
+        # forces bunDeps to build.
+        bunPackageMergeProbe = pkgs.buildBunPackage {
+          pname = "buildBunPackage-merge-probe";
+          src = ./fixtures/bun-package;
+          bunDepsHash = pkgs.lib.fakeHash;
+          nativeBuildInputs = [ pkgs.hello ];
+          buildInputs = [ pkgs.jq ];
+          passthru = { buildBunPackageProbeMarker = "buildBunPackage-merge-probe-marker"; };
+          installPhase = ''
+            runHook preInstall
+            echo buildBunPackage-merge-probe-install-ran > $out
+            runHook postInstall
+          '';
+        };
+
+        # Backs buildBunPackage-bunDeps-stable-across-pname: same src and
+        # bunDepsHash, pname is the only difference under test.
+        bunPackageStabilityProbeA = pkgs.buildBunPackage {
+          pname = "buildBunPackage-stability-probe-a";
+          src = ./fixtures/bun-package;
+          bunDepsHash = pkgs.lib.fakeHash;
+        };
+
+        bunPackageStabilityProbeB = pkgs.buildBunPackage {
+          pname = "buildBunPackage-stability-probe-b-different-name";
+          src = ./fixtures/bun-package;
+          bunDepsHash = pkgs.lib.fakeHash;
+        };
       in
       {
         packages = {
@@ -173,13 +346,9 @@
               echo "all assertions passed" > $out
             '';
 
-          # Zero store references is what lets a consumer copy this one path
-          # into a container from an empty base. A single reintroduced
-          # reference drags its whole transitive closure along and the image
-          # stops being ~2 MB.
-          #
-          # With no references the closure is exactly the package itself, so
-          # `store-paths` minus that one line must be empty.
+          # Zero references is what lets a consumer copy this path alone into
+          # an empty-base container; one reintroduced reference drags its
+          # whole closure along.
           nginx-static-no-tls-has-zero-store-references =
             pkgs.runCommand "nginx-static-no-tls-has-zero-store-references" { } ''
               references=$(grep -Fxv '${nginx-static-no-tls}' ${nginxClosure}/store-paths || true)
@@ -209,11 +378,9 @@
               echo "$actual" > $out
             '';
 
-          # The `-no-tls` in the package name is a safety claim, and this is
-          # what makes it a tested one. Both outcomes are asserted: nginx must
-          # reject an `ssl` listener, AND reject it specifically for the
-          # missing module -- a config broken some other way would otherwise
-          # pass this check while TLS was quietly compiled back in.
+          # Asserts both the rejection AND its cause (missing module) -- a
+          # config broken some other way would otherwise pass this check
+          # while TLS was quietly compiled back in.
           nginx-static-no-tls-rejects-ssl-listener =
             pkgs.runCommand "nginx-static-no-tls-rejects-ssl-listener" { } ''
               printf 'daemon off;\nevents {}\nhttp { server { listen 8397 ssl; } }\n' \
@@ -234,6 +401,171 @@
               fi
 
               cp probe.log $out
+            '';
+
+          # Tripwire for autoPatchelfIgnoreMissingDeps above: if bun ever stops
+          # installing the musl variant, that exclusion goes silently dead.
+          # Depends on the npm registry -- the one non-hermetic check here,
+          # accepted so a builder regression doesn't surface only as a
+          # downstream repo's red CI.
+          bun-fixture-deps-contain-platform-split-natives =
+            pkgs.runCommand "bun-fixture-deps-contain-platform-split-natives" { } ''
+              gnu=$(ls ${bunFixtureDeps} | grep -E 'linux-x64-gnu$' || true)
+              musl=$(ls ${bunFixtureDeps} | grep -E 'linux-x64-musl$' || true)
+
+              echo "gnu variants: $gnu"
+              echo "musl variants: $musl"
+
+              if [ -z "$gnu" ]; then
+                echo "FAIL: no *-linux-x64-gnu package in the deps tree."
+                exit 1
+              fi
+
+              if [ -z "$musl" ]; then
+                echo "FAIL: no *-linux-x64-musl package in the deps tree."
+                exit 1
+              fi
+
+              echo "$gnu $musl" > $out
+            '';
+
+          # Each assertion catches the build silently doing nothing instead of
+          # real work: missing bundle.js, stale output, missing style.css
+          # (native module never loaded), or unminified CSS (loaded but ran).
+          buildBunPackage-builds-fixture =
+            pkgs.runCommand "buildBunPackage-builds-fixture" { } ''
+              if [ ! -f ${bunFixture}/bundle.js ]; then
+                echo "FAIL: esbuild produced no bundle.js -- the bundler never ran."
+                ls -R ${bunFixture}
+                exit 1
+              fi
+
+              if ! grep -q 'buildBunPackage works' ${bunFixture}/bundle.js; then
+                echo "FAIL: bundle.js does not contain the fixture source string."
+                cat ${bunFixture}/bundle.js
+                exit 1
+              fi
+
+              if [ ! -f ${bunFixture}/style.css ]; then
+                echo "FAIL: lightningcss produced no style.css -- the native"
+                echo "module never loaded."
+                ls -R ${bunFixture}
+                exit 1
+              fi
+
+              if grep -q 'rgb(0, 0, 0)' ${bunFixture}/style.css; then
+                echo "FAIL: style.css is not minified -- lightningcss ran but did"
+                echo "no work."
+                cat ${bunFixture}/style.css
+                exit 1
+              fi
+
+              cat ${bunFixture}/style.css > $out
+            '';
+
+          # Asserts the merge/override behavior a downstream repo depends on:
+          # caller args win, and nativeBuildInputs/buildInputs/passthru merge
+          # rather than replace. bunPackageMergeProbe exercises one caller
+          # argument per property.
+          buildBunPackage-forwards-and-merges-caller-args =
+            let
+              nativeBuildInputNames =
+                map (d: d.pname or d.name) bunPackageMergeProbe.drvAttrs.nativeBuildInputs;
+              buildInputNames =
+                map (d: d.pname or d.name) bunPackageMergeProbe.drvAttrs.buildInputs;
+              hasCallerPassthruMarker =
+                (bunPackageMergeProbe.buildBunPackageProbeMarker or null)
+                == "buildBunPackage-merge-probe-marker";
+              hasBuilderPassthruBunDeps = bunPackageMergeProbe ? bunDeps;
+              installPhaseOverridden =
+                bunPackageMergeProbe.drvAttrs.installPhase == ''
+                  runHook preInstall
+                  echo buildBunPackage-merge-probe-install-ran > $out
+                  runHook postInstall
+                '';
+            in
+            pkgs.runCommand "buildBunPackage-forwards-and-merges-caller-args" {
+              nativeBuildInputNames = toString nativeBuildInputNames;
+              buildInputNames = toString buildInputNames;
+              hasCallerPassthruMarker = if hasCallerPassthruMarker then "true" else "false";
+              hasBuilderPassthruBunDeps = if hasBuilderPassthruBunDeps then "true" else "false";
+              installPhaseOverridden = if installPhaseOverridden then "true" else "false";
+            } ''
+              for name in bun nodejs auto-patchelf-hook hello; do
+                case " $nativeBuildInputNames " in
+                  *" $name "*) ;;
+                  *)
+                    echo "FAIL: nativeBuildInputs is missing '$name' -- caller-supplied"
+                    echo "nativeBuildInputs is replacing the builder's own list instead of"
+                    echo "being appended to it. Got: $nativeBuildInputNames"
+                    exit 1
+                    ;;
+                esac
+              done
+
+              for name in gcc jq; do
+                case " $buildInputNames " in
+                  *" $name "*) ;;
+                  *)
+                    echo "FAIL: buildInputs is missing '$name' -- caller-supplied buildInputs"
+                    echo "is replacing the builder's own list instead of being appended to"
+                    echo "it. Got: $buildInputNames"
+                    exit 1
+                    ;;
+                esac
+              done
+
+              if [ "$hasCallerPassthruMarker" != "true" ]; then
+                echo "FAIL: a caller-supplied passthru attribute did not survive --"
+                echo "passthru is replacing the builder's own attrset instead of being"
+                echo "merged with it."
+                exit 1
+              fi
+
+              if [ "$hasBuilderPassthruBunDeps" != "true" ]; then
+                echo "FAIL: passthru.bunDeps is gone once a caller supplies its own"
+                echo "passthru -- callers can no longer reuse the deps tree via"
+                echo "<result>.bunDeps."
+                exit 1
+              fi
+
+              if [ "$installPhaseOverridden" != "true" ]; then
+                echo "FAIL: a caller-supplied installPhase did not win over the builder's"
+                echo "default installPhase -- forwarded caller args are no longer merged"
+                echo "in last."
+                exit 1
+              fi
+
+              echo "caller args merge and override correctly" > $out
+            '';
+
+          # Two calls with the same src and bunDepsHash but different pname
+          # must resolve to the same bunDeps path (see bunDeps above), or two
+          # consumers of the identical bun.lock silently stop sharing one.
+          buildBunPackage-bunDeps-stable-across-pname =
+            let
+              # Discards string context so comparing these paths doesn't force
+              # a real build of the fakeHash-hashed FOD (which would fail).
+              aBunDepsPath =
+                builtins.unsafeDiscardStringContext bunPackageStabilityProbeA.bunDeps.outPath;
+              bBunDepsPath =
+                builtins.unsafeDiscardStringContext bunPackageStabilityProbeB.bunDeps.outPath;
+            in
+            pkgs.runCommand "buildBunPackage-bunDeps-stable-across-pname" {
+              inherit aBunDepsPath bBunDepsPath;
+            } ''
+              if [ "$aBunDepsPath" != "$bBunDepsPath" ]; then
+                echo "FAIL: two buildBunPackage calls with the same src and bunDepsHash"
+                echo "but different pname produced different bunDeps store paths:"
+                echo "  $aBunDepsPath"
+                echo "  $bBunDepsPath"
+                echo "This means fetchBunDeps's pname is being derived from the caller's"
+                echo "pname again, which breaks reuse of a shared deps tree across"
+                echo "callers building the same bun.lock."
+                exit 1
+              fi
+
+              echo "bunDeps stable across pname: $aBunDepsPath" > $out
             '';
         };
       });

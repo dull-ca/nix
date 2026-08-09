@@ -70,3 +70,68 @@ with your reverse proxy's actual address range before it will trust the
 `X-Forwarded-For` it's given — that range is the deploying project's call to
 make, not this package's. Never set it to `0.0.0.0/0`: that lets any client
 supply its own address and have it recorded as the truth in your logs.
+
+## `buildBunPackage`
+
+A `buildNpmPackage`-equivalent for bun: fetches `bun.lock`-pinned deps as a
+fixed-output derivation, no build-time network access, then runs the build script.
+
+```nix
+{
+  inputs.dull-nix.url = "github:dull-ca/nix";
+
+  outputs = { self, nixpkgs, dull-nix, ... }: {
+    packages.x86_64-linux.site =
+      let
+        pkgs = import nixpkgs {
+          system = "x86_64-linux";
+          overlays = [ dull-nix.overlays.default ];
+        };
+      in
+      pkgs.buildBunPackage {
+        pname = "site";
+        src = ./.;
+        bunDepsHash = "sha256-...";
+      };
+  };
+}
+```
+
+`buildScript` (default `"build"`) and `installDir` (default `"dist"`) cover
+the common case; everything else forwards to `mkDerivation`, and a caller's
+own `nativeBuildInputs`/`buildInputs`/`passthru` merge in rather than replace.
+
+nixpkgs-unstable has `fetchNpmDeps`/`pnpm.fetchDeps` but no bun equivalent —
+`fetchBunDeps`/`buildBunPackage` fill that gap with the same fixed-output
+approach. Like `npmDepsHash`, `bunDepsHash` needs bumping by hand on every
+`bun.lock` change: set it to `pkgs.lib.fakeHash`, build, and take the real
+value from the `got:` line of the mismatch nix reports.
+
+It also runs `bun install --ignore-scripts`, so a dependency whose
+postinstall does real work fails at build time instead — hit with
+`lightningcss-cli` (`command not found` for `.bin/lightningcss` until
+`postinstall.js` replaces it; fixed by depending on `lightningcss`, the
+library, which needs none).
+
+### Two settings that look removable but aren't
+
+`autoPatchelfIgnoreMissingDeps = [ "libc.musl-x86_64.so.1" ]` — bun installs
+a `-musl` build of every native dependency alongside the `-gnu` one this
+platform actually loads. The musl libc dependency is never really missing,
+just never loaded. Delete the exclusion and `autoPatchelf` treats it as fatal:
+
+```
+auto-patchelf could not satisfy dependency libc.musl-x86_64.so.1
+```
+
+`patchShebangs node_modules` scans the whole tree, not just `.bin`. This
+repo's fixture doesn't prove the wider scope necessary — `.bin` entries are
+symlinks that `patchShebangs` follows to the same target either way. It is
+necessary on the real dull.yyc.dev site build: Astro reaches
+`node_modules/astro/astro.js` by a relative path, never through `.bin`, so the
+narrow scan leaves its shebang unpatched and the build dies with a bad
+interpreter.
+
+`checks.buildBunPackage-builds-fixture` runs a real `bun install` against the
+npm registry — the one non-hermetic check here, kept so a regression in
+`buildBunPackage` doesn't surface only as a downstream repo's red CI.
