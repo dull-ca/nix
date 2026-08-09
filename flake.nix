@@ -84,6 +84,117 @@
             outputHashAlgo = "sha256";
             outputHash = hash;
           };
+
+        buildBunPackage =
+          { src
+          , bunDepsHash
+          , buildScript ? "build"
+          , installDir ? "dist"
+          , nativeBuildInputs ? [ ]
+          , buildInputs ? [ ]
+          , passthru ? { }
+          , ...
+          }@args:
+          let
+            # No pname passed through: a fixed-output derivation's store path
+            # is a function of (name, hashAlgo, hash) alone, never its src or
+            # other inputs. Deriving this name from the caller's pname would
+            # give two callers building the same bun.lock two different
+            # bunDeps store paths instead of one shared one -- verified
+            # directly by comparing outPaths with matching hashes and
+            # differing pnames. Leaving it off lets fetchBunDeps's own
+            # default pname keep every caller on the same path.
+            bunDeps = final.fetchBunDeps {
+              inherit src;
+              hash = bunDepsHash;
+            };
+
+            forwarded = builtins.removeAttrs args [
+              "bunDepsHash"
+              "buildScript"
+              "installDir"
+              "nativeBuildInputs"
+              "buildInputs"
+              "passthru"
+            ];
+          in
+          # forwarded is merged in last, so it wins over every attribute set
+          # below -- a caller can override any of them, including phases.
+          # A downstream repo relies on this to reuse buildBunPackage for a
+          # check script by overriding installPhase outright, for a build
+          # that produces no output directory to `cp -r`.
+          final.stdenvNoCC.mkDerivation ({
+            inherit src;
+            # mkDerivation requires name, or pname + version; forwarded args
+            # can still override this like any other default above.
+            version = "0";
+
+            # Appended to, not left for forwarded's `//` to replace outright:
+            # a caller adding its own nativeBuildInputs/buildInputs/passthru
+            # keeps bun, nodejs, autoPatchelfHook and bunDeps alongside its
+            # own additions rather than losing them.
+            nativeBuildInputs = [
+              final.bun
+              final.nodejs
+              final.autoPatchelfHook
+            ] ++ nativeBuildInputs;
+
+            buildInputs = [ final.stdenv.cc.cc.lib ] ++ buildInputs;
+
+            # bun installs *-linux-x64-musl builds of native deps alongside
+            # the *-linux-x64-gnu ones this platform actually loads; the musl
+            # ones are never loaded, so their libc dependency is never really
+            # missing. Without this, autoPatchelf treats it as fatal instead
+            # of ignorable: deleting this line fails the fixture build with
+            # "auto-patchelf could not satisfy dependency
+            # libc.musl-x86_64.so.1 wanted by
+            # node_modules/lightningcss-linux-x64-musl/...".
+            autoPatchelfIgnoreMissingDeps = [ "libc.musl-x86_64.so.1" ];
+            # autoPatchelfHook's own fixup-phase pass would scan $out after
+            # install, but by then $out holds this package's build output
+            # (JS/CSS here), not ELF -- there's nothing there to patch. What
+            # needs patching is the deps tree, and it already was, explicitly,
+            # in configurePhase below, before the build even ran.
+            dontAutoPatchelf = true;
+
+            configurePhase = ''
+              runHook preConfigure
+              cp -r ${bunDeps} node_modules
+              chmod -R u+w node_modules
+              autoPatchelf node_modules
+              # Whole tree, not node_modules/.bin: .bin entries are symlinks,
+              # and patchShebangs follows a symlink to patch the real file
+              # underneath, so on this fixture either scope reaches the same
+              # target and both pass -- this fixture does not prove the wider
+              # scope necessary. It is necessary on the real dull.yyc.dev site
+              # build: astro reaches node_modules/astro/astro.js by a relative
+              # path, never through .bin, so patchShebangs node_modules/.bin
+              # there leaves its "#!/usr/bin/env node" shebang unpatched and
+              # the build dies with a bad interpreter.
+              patchShebangs node_modules
+              runHook postConfigure
+            '';
+
+            buildPhase = ''
+              runHook preBuild
+              export HOME=$TMPDIR
+              bun run ${buildScript}
+              runHook postBuild
+            '';
+
+            installPhase = ''
+              runHook preInstall
+              cp -r ${installDir} $out
+              runHook postInstall
+            '';
+
+            # Exposes the fetched deps tree so a consumer needing the same
+            # node_modules for something else -- e.g. running a lint/typecheck
+            # against this package's deps -- can reuse it via
+            # `<result>.bunDeps` instead of calling fetchBunDeps again with a
+            # separately-tracked, duplicate hash.
+            passthru = { inherit bunDeps; } // passthru;
+          } // forwarded);
       };
     } // flake-utils.lib.eachSystem [ "x86_64-linux" ] (system:
       let
@@ -192,14 +303,20 @@
         # esbuild is statically linked and has no platform split, but its
         # bin/esbuild is a `#!/usr/bin/env node` script reached through a
         # node_modules/.bin symlink -- the shape a later shebang-patching
-        # builder has to prove it can follow. lightningcss-cli is what
-        # actually resolves platform-split natives here: `bun install`
-        # against this fixture yields both lightningcss-cli-linux-x64-gnu and
-        # lightningcss-cli-linux-x64-musl, which the check below asserts.
+        # builder has to prove it can follow. lightningcss is what actually
+        # resolves platform-split natives here: `bun install` against this
+        # fixture yields both lightningcss-linux-x64-gnu and
+        # lightningcss-linux-x64-musl, which the check below asserts.
         bunFixtureDeps = pkgs.fetchBunDeps {
           src = ./fixtures/bun-package;
           pname = "bun-fixture-deps";
-          hash = "sha256-EpIXt4f4CK7o6yI4lYrCQcOSWQgIxzIOBSMdxpeH3/o=";
+          hash = "sha256-PaMiYRjIKk5QjvXhbvfVPSJNz2fhCIZuBT9SPOUo1rg=";
+        };
+
+        bunFixture = pkgs.buildBunPackage {
+          pname = "bun-fixture";
+          src = ./fixtures/bun-package;
+          bunDepsHash = "sha256-PaMiYRjIKk5QjvXhbvfVPSJNz2fhCIZuBT9SPOUo1rg=";
         };
       in
       {
@@ -356,6 +473,45 @@
               fi
 
               echo "$gnu $musl" > $out
+            '';
+
+          # Each assertion targets a way the fixture build could silently do
+          # nothing instead of the real work: no bundle.js (the bundler never
+          # ran), a bundle without the fixture's own source string (stale or
+          # empty output slipping past the first check), no style.css (the
+          # native lightningcss module never loaded -- autoPatchelf or
+          # patchShebangs regressed), and, the one a passing build could
+          # otherwise still hide, style.css still containing the unminified
+          # `rgb(0, 0, 0)` -- proof the native module loaded but did no work.
+          buildBunPackage-builds-fixture =
+            pkgs.runCommand "buildBunPackage-builds-fixture" { } ''
+              if [ ! -f ${bunFixture}/bundle.js ]; then
+                echo "FAIL: esbuild produced no bundle.js -- the bundler never ran."
+                ls -R ${bunFixture}
+                exit 1
+              fi
+
+              if ! grep -q 'buildBunPackage works' ${bunFixture}/bundle.js; then
+                echo "FAIL: bundle.js does not contain the fixture source string."
+                cat ${bunFixture}/bundle.js
+                exit 1
+              fi
+
+              if [ ! -f ${bunFixture}/style.css ]; then
+                echo "FAIL: lightningcss produced no style.css -- the native"
+                echo "module never loaded."
+                ls -R ${bunFixture}
+                exit 1
+              fi
+
+              if grep -q 'rgb(0, 0, 0)' ${bunFixture}/style.css; then
+                echo "FAIL: style.css is not minified -- lightningcss ran but did"
+                echo "no work."
+                cat ${bunFixture}/style.css
+                exit 1
+              fi
+
+              cat ${bunFixture}/style.css > $out
             '';
         };
       });

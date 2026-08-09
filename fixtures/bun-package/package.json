@@ -3,10 +3,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "esbuild src/index.js --bundle --minify --outfile=dist/bundle.js && lightningcss --minify src/style.css -o dist/style.css"
+    "build": "esbuild src/index.js --bundle --minify --outfile=dist/bundle.js && node src/build-css.js"
   },
   "dependencies": {
     "esbuild": "^0.25.0",
-    "lightningcss-cli": "^1.30.0"
+    "lightningcss": "^1.30.0"
   }
 }
