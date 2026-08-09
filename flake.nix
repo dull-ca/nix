@@ -15,9 +15,82 @@
   };
 
   outputs = { self, nixpkgs, flake-utils }:
-    flake-utils.lib.eachSystem [ "x86_64-linux" ] (system:
+    {
+      overlays.default = final: prev: {
+        # The nixpkgs-unstable this flake pins has buildNpmPackage/fetchNpmDeps
+        # for npm and pnpm.fetchDeps for pnpm, but no bun equivalent --
+        # buildBunPackage, bun.fetchDeps and bunConfigHook do not exist there.
+        # fetchBunDeps is that missing piece, the same mechanism nixpkgs
+        # blesses for npm, written once here so bun consumers get it the way
+        # an npm project gets fetchNpmDeps. As with npmDepsHash on any
+        # buildNpmPackage, every change to a consumer's bun.lock means bumping
+        # its `hash` argument here.
+        fetchBunDeps =
+          { src
+          , hash
+          , pname ? "bun-deps"
+          }:
+          let
+            # Only package.json and bun.lock decide what `bun install`
+            # resolves, so only those two files are read into this
+            # derivation's input. Anything else changing under `src` --
+            # source code, unrelated fixture files -- must not force a
+            # rebuild that hits the network.
+            lockSrc = final.lib.cleanSourceWith {
+              inherit src;
+              name = "${pname}-lock-src";
+              filter = path: type:
+                type == "regular"
+                && builtins.elem (baseNameOf path) [ "package.json" "bun.lock" ];
+            };
+          in
+          final.stdenvNoCC.mkDerivation {
+            inherit pname;
+            version = "0";
+            src = lockSrc;
+
+            nativeBuildInputs = [ final.bun final.cacert ];
+
+            buildPhase = ''
+              runHook preBuild
+              export HOME=$TMPDIR
+              # stdenvNoCC's sandbox has no system CA trust store; without
+              # this, bun's HTTPS requests to the registry fail certificate
+              # verification outright.
+              export SSL_CERT_FILE=${final.cacert}/etc/ssl/certs/ca-bundle.crt
+              # No postinstall scripts run, so a dependency that needs one is
+              # not supported by this builder. Also part of what keeps this
+              # FOD hashable: a script could read the network, the clock, or
+              # anything else outside package.json/bun.lock, and the output
+              # hash would stop being reproducible.
+              bun install --frozen-lockfile --no-progress --ignore-scripts
+              runHook postBuild
+            '';
+
+            installPhase = ''
+              runHook preInstall
+              # Both are per-install bookkeeping bun writes that package.json
+              # and bun.lock alone don't pin down. Left in, they would make
+              # this FOD's output hash unreproducible between otherwise
+              # identical builds.
+              rm -rf node_modules/.cache
+              find node_modules -name '.bun-tag*' -delete
+              cp -r node_modules $out
+              runHook postInstall
+            '';
+
+            dontFixup = true;
+            outputHashMode = "recursive";
+            outputHashAlgo = "sha256";
+            outputHash = hash;
+          };
+      };
+    } // flake-utils.lib.eachSystem [ "x86_64-linux" ] (system:
       let
-        pkgs = import nixpkgs { inherit system; };
+        pkgs = import nixpkgs {
+          inherit system;
+          overlays = [ self.overlays.default ];
+        };
         static = pkgs.pkgsStatic;
 
         # Our own build of nginx, NOT an override of nixpkgs' package.
@@ -115,6 +188,19 @@
         # `nix-support` -- both of which are multi-megabyte jumps, not
         # kilobyte drift.
         closureSizeCeilingBytes = 2500000;
+
+        # esbuild is statically linked and has no platform split, but its
+        # bin/esbuild is a `#!/usr/bin/env node` script reached through a
+        # node_modules/.bin symlink -- the shape a later shebang-patching
+        # builder has to prove it can follow. lightningcss-cli is what
+        # actually resolves platform-split natives here: `bun install`
+        # against this fixture yields both lightningcss-cli-linux-x64-gnu and
+        # lightningcss-cli-linux-x64-musl, which the check below asserts.
+        bunFixtureDeps = pkgs.fetchBunDeps {
+          src = ./fixtures/bun-package;
+          pname = "bun-fixture-deps";
+          hash = "sha256-EpIXt4f4CK7o6yI4lYrCQcOSWQgIxzIOBSMdxpeH3/o=";
+        };
       in
       {
         packages = {
@@ -234,6 +320,42 @@
               fi
 
               cp probe.log $out
+            '';
+
+          # bun installs *-linux-x64-musl native packages alongside the
+          # *-linux-x64-gnu ones that actually load on this platform. A later
+          # builder relies on that by ignoring the missing musl libc
+          # (autoPatchelfIgnoreMissingDeps = [ "libc.musl-x86_64.so.1" ]). If
+          # bun ever stops installing the musl variant, that exclusion goes
+          # silently dead and starts hiding a genuinely missing dependency
+          # instead of a harmless one. This check is the tripwire: it fails
+          # the moment a real `bun install` stops producing a musl variant,
+          # rather than leaving that assumption unverified in the builder.
+          #
+          # It is also the one check in this flake that depends on the npm
+          # registry -- an accepted trade, not an oversight. Without it, a
+          # regression in the bun builder only shows up as a downstream
+          # repo's red CI, and the weekly update.yml nixpkgs bump has no way
+          # to report that it broke the builder.
+          bun-fixture-deps-contain-platform-split-natives =
+            pkgs.runCommand "bun-fixture-deps-contain-platform-split-natives" { } ''
+              gnu=$(ls ${bunFixtureDeps} | grep -E 'linux-x64-gnu$' || true)
+              musl=$(ls ${bunFixtureDeps} | grep -E 'linux-x64-musl$' || true)
+
+              echo "gnu variants: $gnu"
+              echo "musl variants: $musl"
+
+              if [ -z "$gnu" ]; then
+                echo "FAIL: no *-linux-x64-gnu package in the deps tree."
+                exit 1
+              fi
+
+              if [ -z "$musl" ]; then
+                echo "FAIL: no *-linux-x64-musl package in the deps tree."
+                exit 1
+              fi
+
+              echo "$gnu $musl" > $out
             '';
         };
       });
