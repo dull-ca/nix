@@ -158,6 +158,177 @@
             passthru = { inherit bunDeps; } // passthru;
           } // forwarded);
 
+        # The gleam equivalent of fetchBunDeps above -- with one difference
+        # worth the paragraph, because the asymmetry between the two is
+        # otherwise going to read as an oversight.
+        #
+        # `manifest.toml` is a complete lockfile: gleam records an
+        # `outer_checksum` for every hex package, and that checksum *is* the
+        # SHA-256 of the tarball hex serves. Every hash this fetch needs is
+        # therefore already in a file gleam maintains, so there is no
+        # fixed-output derivation here and no `gleamDepsHash` for anyone to
+        # bump. Adding a dependency updates `manifest.toml` and that is the
+        # whole of it. fetchBunDeps needs its hash because bun's lockfile
+        # offers no equivalent, not because this one is cutting a corner.
+        #
+        # Only `source = "hex"` entries are fetched. A `local` path dependency
+        # is resolved by gleam straight from the filesystem and never looked for
+        # here, so omitting it is correct; if its path escapes the build's
+        # source root, gleam says so itself and by name. A `git` dependency has
+        # no checksum in the manifest and cannot be fetched purely, so it is
+        # refused outright rather than left to fail later as a sandbox with no
+        # network.
+        fetchGleamDeps =
+          { manifest
+          , pname ? "gleam-deps"
+          }:
+          let
+            inherit (final) lib;
+
+            parsed = builtins.fromTOML (builtins.readFile manifest);
+            packages = parsed.packages or [ ];
+            fromSource = source: builtins.filter (p: p.source == source) packages;
+
+            gitPackages = fromSource "git";
+            hexPackages = lib.sort (a: b: a.name < b.name) (fromSource "hex");
+
+            refuseGitPackages =
+              throw ''
+                fetchGleamDeps cannot fetch the git dependencies in ${toString manifest}:
+                  ${lib.concatMapStringsSep "\n  " (p: p.name) gitPackages}
+                A git source carries no checksum in manifest.toml, so there is
+                nothing to verify a fetch against. Depend on a hex release, or
+                vendor the package as a local path dependency.
+              '';
+
+            # `outer_checksum` is upper-case hex; nix wants it lower-case.
+            tarballFor = p: final.fetchurl {
+              url = "https://repo.hex.pm/tarballs/${p.name}-${p.version}.tar";
+              sha256 = lib.toLower p.outer_checksum;
+            };
+
+            # A hex tarball is an outer tar holding `contents.tar.gz`, and it is
+            # that inner archive gleam expects unpacked under the package name.
+            unpack = p: ''
+              mkdir -p "$out/${p.name}"
+              tar -xf ${tarballFor p} -C "$TMPDIR/outer" contents.tar.gz
+              tar -xzf "$TMPDIR/outer/contents.tar.gz" -C "$out/${p.name}"
+              rm "$TMPDIR/outer/contents.tar.gz"
+            '';
+
+            # How gleam decides a package is already present and skips the
+            # network. Written sorted so the file does not vary between
+            # otherwise identical builds -- gleam's own copy is emitted in hash
+            # order and would.
+            index = lib.concatMapStrings (p: "${p.name} = \"${p.version}\"\n") hexPackages;
+          in
+          if gitPackages != [ ] then refuseGitPackages else
+          final.runCommand pname { } ''
+            mkdir -p "$out" "$TMPDIR/outer"
+            ${lib.concatMapStrings unpack hexPackages}
+            cat > "$out/packages.toml" <<'PACKAGES'
+            [packages]
+            ${index}
+            [git]
+            PACKAGES
+            touch "$out/gleam.lock"
+          '';
+
+        # Compiles a gleam package with its dependencies already on disk, so the
+        # build needs no network. `target` picks what comes out: an
+        # `erlang-shipment` ready to run under `erl`, or the compiled javascript
+        # tree for a bundler to take from.
+        #
+        # rebar3 and gnumake are unconditional. Plenty of gleam packages depend
+        # on a hex package written in erlang, gleam shells out to rebar3 to
+        # build those, and a builder that lacks it fails only in whichever
+        # consumer first needs it.
+        #
+        # Unrecognised arguments are forwarded to mkDerivation and merged last,
+        # so a caller can replace `buildPhase`/`installPhase` outright -- which
+        # is how a consumer runs `gleam test` or `gleam format --check` against
+        # this same dependency tree instead of resolving a second one.
+        buildGleamPackage =
+          { pname
+          , src
+          , version ? "0"
+          , target ? "erlang"
+          , manifest ? src + "/manifest.toml"
+          , erlang ? final.beam27Packages.erlang
+          , nativeBuildInputs ? [ ]
+          , passthru ? { }
+          , ...
+          }@args:
+          let
+            gleamDeps = final.fetchGleamDeps {
+              inherit manifest;
+              pname = "${pname}-deps";
+            };
+
+            forwarded = builtins.removeAttrs args [
+              "target"
+              "manifest"
+              "erlang"
+              "nativeBuildInputs"
+              "passthru"
+            ];
+
+            targets = {
+              erlang = {
+                build = "gleam export erlang-shipment";
+                install = "build/erlang-shipment";
+              };
+              javascript = {
+                build = "gleam build --target javascript";
+                install = "build/dev/javascript";
+              };
+            };
+
+            chosen = targets.${target} or (throw
+              "buildGleamPackage: target must be \"erlang\" or \"javascript\", not \"${target}\"");
+          in
+          final.stdenvNoCC.mkDerivation ({
+            inherit pname version src;
+
+            nativeBuildInputs = [
+              final.gleam
+              erlang
+              final.rebar3
+              final.gnumake
+            ] ++ nativeBuildInputs;
+
+            # Copied rather than symlinked: gleam writes into build/packages
+            # while it works, and a store path is read-only.
+            configurePhase = ''
+              runHook preConfigure
+              export HOME="$TMPDIR/home"
+              mkdir -p "$HOME" build
+              cp -r ${gleamDeps} build/packages
+              chmod -R u+w build/packages
+              runHook postConfigure
+            '';
+
+            buildPhase = ''
+              runHook preBuild
+              ${chosen.build}
+              runHook postBuild
+            '';
+
+            installPhase = ''
+              runHook preInstall
+              cp -r ${chosen.install} "$out"
+              runHook postInstall
+            '';
+
+            # The output is compiled BEAM or javascript. Nothing here is an ELF
+            # binary for the usual fixup to strip, patch or shrink.
+            dontFixup = true;
+
+            # `<result>.gleamDeps`, for a check that compiles the same source a
+            # second way without fetching the tree again.
+            passthru = { inherit gleamDeps; } // passthru;
+          } // forwarded);
+
         releaseGuards = final.runCommand "release-guards"
           {
             meta.mainProgram = "release-guards";
@@ -385,6 +556,44 @@
           bunDepsHash = pkgs.lib.fakeHash;
         };
 
+        gleamFixtureDeps = pkgs.fetchGleamDeps {
+          manifest = ./fixtures/gleam-package/manifest.toml;
+          pname = "gleam-fixture-deps";
+        };
+
+        # Carries thoas, which rebar3 builds, so this exercises both compilers.
+        gleamFixtureShipment = pkgs.buildGleamPackage {
+          pname = "gleam-fixture";
+          src = ./fixtures/gleam-package;
+        };
+
+        gleamJsFixture = pkgs.buildGleamPackage {
+          pname = "gleam-js-fixture";
+          src = ./fixtures/gleam-js-package;
+          target = "javascript";
+        };
+
+        # Backs buildGleamPackage-forwards-and-merges-caller-args. Replacing
+        # both phases is the documented way a consumer runs `gleam test` or
+        # `gleam format --check` against an already-resolved dependency tree,
+        # so it is the merge behaviour that most needs holding.
+        gleamPackageMergeProbe = pkgs.buildGleamPackage {
+          pname = "buildGleamPackage-merge-probe";
+          src = ./fixtures/gleam-package;
+          nativeBuildInputs = [ pkgs.hello ];
+          passthru = { gleamPackageProbeMarker = "buildGleamPackage-merge-probe-marker"; };
+          buildPhase = ''
+            runHook preBuild
+            gleam format --check src
+            runHook postBuild
+          '';
+          installPhase = ''
+            runHook preInstall
+            echo buildGleamPackage-merge-probe-install-ran > $out
+            runHook postInstall
+          '';
+        };
+
         # A consumer with no Rust in it: the hooks write package.json, and the
         # cliff.toml comes from the shared default rather than a per-repo one.
         releaseFixture = pkgs.mkReleaseCommand {
@@ -401,6 +610,145 @@
 
         checks = {
           release-guards-hold = pkgs.releaseGuardsTest;
+
+          # packages.toml is how gleam decides a dependency is already on disk
+          # and skips the network. Its format is read from gleam's behaviour
+          # rather than from any specification, so it is asserted here: if a
+          # future gleam changes it, this fails with the reason attached
+          # instead of every consumer failing as an unexplained network attempt
+          # inside a sandbox.
+          fetchGleamDeps-writes-the-index-gleam-reads =
+            pkgs.runCommand "fetchGleamDeps-writes-the-index-gleam-reads" { } ''
+              index=${gleamFixtureDeps}/packages.toml
+              cat "$index"
+
+              grep -Fqx '[packages]' "$index" \
+                || { echo "FAIL: no [packages] table"; exit 1; }
+              grep -Fqx '[git]' "$index" \
+                || { echo "FAIL: no [git] table -- gleam writes one even when empty"; exit 1; }
+              grep -Fqx 'gleam_stdlib = "1.0.5"' "$index" \
+                || { echo "FAIL: the hex package is not indexed at its locked version"; exit 1; }
+              grep -Fqx 'thoas = "1.2.1"' "$index" \
+                || { echo "FAIL: the rebar3 package is not indexed"; exit 1; }
+
+              # Sorted, so the file cannot vary between identical builds.
+              packages=$(sed -n '/^\[packages\]$/,/^\[git\]$/p' "$index" \
+                | grep ' = ' | cut -d' ' -f1)
+              [ "$packages" = "$(printf '%s\n' "$packages" | sort)" ] \
+                || { echo "FAIL: the index is not in sorted order"; exit 1; }
+
+              test -f ${gleamFixtureDeps}/gleam_stdlib/gleam.toml \
+                || { echo "FAIL: the package contents were not unpacked"; exit 1; }
+              test -f ${gleamFixtureDeps}/gleam.lock \
+                || { echo "FAIL: no gleam.lock"; exit 1; }
+
+              touch $out
+            '';
+
+          # gleam resolves a path dependency from the filesystem, so the tree
+          # must leave it out rather than fail trying to fetch something that
+          # has no checksum and no url.
+          fetchGleamDeps-skips-local-path-dependencies =
+            let
+              deps = pkgs.fetchGleamDeps {
+                manifest = ./fixtures/gleam-manifests/with-local-path.toml;
+                pname = "gleam-local-path-deps";
+              };
+            in
+            pkgs.runCommand "fetchGleamDeps-skips-local-path-dependencies" { } ''
+              test -d ${deps}/gleam_stdlib \
+                || { echo "FAIL: the hex package beside the path dependency was dropped"; exit 1; }
+
+              if [ -e ${deps}/a_sibling_package ]; then
+                echo "FAIL: a local path dependency was fetched into the tree"
+                exit 1
+              fi
+              if grep -q a_sibling_package ${deps}/packages.toml; then
+                echo "FAIL: a local path dependency was written into packages.toml"
+                exit 1
+              fi
+
+              touch $out
+            '';
+
+          # Evaluated, never built: the refusal is a `throw`, so the failure has
+          # to be caught at evaluation time.
+          fetchGleamDeps-refuses-git-dependencies =
+            let
+              attempt = builtins.tryEval (pkgs.fetchGleamDeps {
+                manifest = ./fixtures/gleam-manifests/with-git-dependency.toml;
+                pname = "gleam-git-deps";
+              }).outPath;
+            in
+            pkgs.runCommand "fetchGleamDeps-refuses-git-dependencies" { } ''
+              ${pkgs.lib.optionalString attempt.success ''
+                echo "FAIL: a git dependency evaluated instead of being refused."
+                echo "Nothing verifies such a fetch, so it must not be attempted."
+                exit 1
+              ''}
+              touch $out
+            '';
+
+          # A package that compiles is not necessarily a package that runs, and
+          # the shipment is what the container actually executes.
+          buildGleamPackage-erlang-shipment-runs =
+            pkgs.runCommand "buildGleamPackage-erlang-shipment-runs"
+              { nativeBuildInputs = [ pkgs.beam27Packages.erlang ]; } ''
+              # thoas is compiled by rebar3 and by nothing else in this build,
+              # so its beam reaching the shipment is the assertion that gleam
+              # found a working rebar3.
+              test -f ${gleamFixtureShipment}/thoas/ebin/thoas.beam \
+                || { echo "FAIL: the rebar3-built dependency never compiled"; exit 1; }
+
+              erl -pa ${gleamFixtureShipment}/*/ebin \
+                -eval 'gleam_fixture@@main:run(gleam_fixture)' -noshell > out.log
+
+              grep -Fqx 'GLEAM-FIXTURE-RAN' out.log \
+                || { echo "FAIL: the shipment did not run its main:"; cat out.log; exit 1; }
+
+              cp out.log $out
+            '';
+
+          buildGleamPackage-javascript-target-runs =
+            pkgs.runCommand "buildGleamPackage-javascript-target-runs"
+              { nativeBuildInputs = [ pkgs.nodejs ]; } ''
+              cat > run.mjs <<'ENTRY'
+              import { main } from "${gleamJsFixture}/gleam_js_fixture/gleam_js_fixture.mjs";
+              main();
+              ENTRY
+
+              node run.mjs > out.log
+
+              grep -Fqx 'GLEAM-JS-FIXTURE-RAN' out.log \
+                || { echo "FAIL: the built javascript did not run:"; cat out.log; exit 1; }
+
+              cp out.log $out
+            '';
+
+          # Replacing both phases is how a consumer reuses the resolved tree for
+          # a test or format run, so caller arguments have to survive the merge
+          # rather than be overwritten by the builder's own.
+          buildGleamPackage-forwards-and-merges-caller-args =
+            pkgs.runCommand "buildGleamPackage-forwards-and-merges-caller-args" { } ''
+              grep -Fqx 'buildGleamPackage-merge-probe-install-ran' ${gleamPackageMergeProbe} \
+                || { echo "FAIL: the caller's installPhase did not replace the builder's"; exit 1; }
+
+              [ '${gleamPackageMergeProbe.gleamPackageProbeMarker}' \
+                = 'buildGleamPackage-merge-probe-marker' ] \
+                || { echo "FAIL: the caller's passthru was lost"; exit 1; }
+
+              # The builder's own inputs must survive the caller adding theirs:
+              # without gleam the replaced buildPhase above could not have run.
+              [ -n '${toString (builtins.elem pkgs.hello gleamPackageMergeProbe.nativeBuildInputs)}' ] \
+                || { echo "FAIL: the caller's nativeBuildInputs were dropped"; exit 1; }
+              ${pkgs.lib.optionalString
+                (!builtins.elem pkgs.gleam gleamPackageMergeProbe.nativeBuildInputs) ''
+                echo "FAIL: the builder's own gleam was replaced by the caller's inputs"
+                exit 1
+              ''}
+
+              touch $out
+            '';
 
           # The version-bearing file is the consumer's business, so the builder
           # is only correct if a hook it never heard of can carry it. This one

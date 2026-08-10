@@ -136,6 +136,79 @@ interpreter.
 npm registry — the one non-hermetic check here, kept so a regression in
 `buildBunPackage` doesn't surface only as a downstream repo's red CI.
 
+## `fetchGleamDeps` and `buildGleamPackage`
+
+The gleam pair to the bun one above: dependencies fetched from `manifest.toml`,
+no build-time network, then `gleam` compiles.
+
+```nix
+pkgs.buildGleamPackage {
+  pname = "server";
+  src = ./server;
+}
+```
+
+`target` (default `"erlang"`) picks the output. `"erlang"` exports an
+`erlang-shipment` — the directory of `*/ebin` trees you run with `erl -pa`.
+`"javascript"` gives the compiled JS tree for a bundler to take from. `erlang`
+(default `beam27Packages.erlang`) picks the OTP the build runs on. Everything
+else forwards to `mkDerivation`, and a caller's `nativeBuildInputs`/`passthru`
+merge in rather than replace.
+
+Because the arguments forward, replacing both phases is how you reuse the
+resolved dependency tree for something other than a build:
+
+```nix
+pkgs.buildGleamPackage {
+  pname = "server-test";
+  src = ./server;
+  buildPhase = "gleam test";
+  installPhase = "touch $out";
+}
+```
+
+### No hash to maintain, unlike `bunDepsHash`
+
+`fetchGleamDeps` takes no hash argument, and the asymmetry with `fetchBunDeps`
+right above it is deliberate rather than an oversight.
+
+Gleam's `manifest.toml` records an `outer_checksum` for every hex package, and
+that checksum *is* the SHA-256 of the tarball hex serves. Every hash the fetch
+needs is therefore already in a file gleam maintains, so this is an ordinary
+`fetchurl` per package rather than a fixed-output derivation over the whole
+tree. Adding a dependency updates `manifest.toml` and nothing else has to
+change. `fetchBunDeps` needs `bunDepsHash` because bun's lockfile records no
+such digest — not because this one is cutting a corner.
+
+`rebar3` and `gnumake` are always present: many hex packages are written in
+erlang, gleam shells out to rebar3 to build those, and a builder missing it
+fails only in whichever consumer first depends on one. The fixture carries
+`thoas` for exactly that reason, and the check asserts its compiled beam
+reached the shipment.
+
+### What it will not do
+
+A `source = "git"` dependency is **refused at evaluation time**. The manifest
+carries no checksum for one, so nothing could verify the fetch; refusing is
+better than a sandbox failing later with an unexplained network error. Depend
+on a hex release or vendor the package as a path dependency.
+
+A `source = "local"` path dependency is skipped, which is correct — gleam
+resolves those from the filesystem and never looks under `build/packages`. Note
+that it resolves them *relative to the package directory*, so a path escaping
+the build's source root (`../client` from `./server`) cannot work in a sandbox
+at all. That is a reason to structure the packages so it does not arise; gleam
+reports it clearly enough when it does.
+
+### `packages.toml` is an unspecified interface
+
+Gleam decides a dependency is already on disk by reading
+`build/packages/packages.toml`, and that format is read from gleam's behaviour
+rather than from any specification. `checks.fetchGleamDeps-writes-the-index-gleam-reads`
+pins it, so a gleam release that changes it fails here with the reason
+attached, rather than in every consumer as a network attempt inside a sandbox
+that has no network.
+
 ## `mkReleaseCommand`
 
 A `release` command for a repository whose `main` is squash-merged with

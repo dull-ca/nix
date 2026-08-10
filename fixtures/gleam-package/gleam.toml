@@ -1,0 +1,11 @@
+name = "gleam_fixture"
+version = "1.0.0"
+
+# thoas is built by rebar3 rather than by gleam, and it is here for exactly
+# that reason: it is what proves buildGleamPackage carries a working rebar3.
+# Nothing in src/ calls it -- the check asserts its compiled beam reached the
+# shipment, which is only true if rebar3 ran.
+
+[dependencies]
+gleam_stdlib = ">= 0.34.0 and < 2.0.0"
+thoas = ">= 1.0.0 and < 2.0.0"
