@@ -1,0 +1,10 @@
+name = "gleam_js_fixture"
+target = "javascript"
+version = "1.0.0"
+
+# Deliberately stdlib-only. The erlang fixture beside this one carries the
+# rebar3 dependency; a package built for javascript cannot, because rebar3
+# compiles erlang and nothing else.
+
+[dependencies]
+gleam_stdlib = ">= 0.34.0 and < 2.0.0"
