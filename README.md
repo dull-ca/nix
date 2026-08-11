@@ -398,3 +398,7 @@ watched with `gh`, the version-bearing files, and the cache-warming command.
 Those are `hooks` and `warmCommand`. Adding any of them here would make this
 package know about one repository.
 
+
+## License
+
+MIT. See [LICENSE](LICENSE).
